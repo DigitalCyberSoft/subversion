@@ -1460,6 +1460,28 @@ svn_config_ensure(const char *config_dir, apr_pool_t *pool)
         "### path separator.  A single backslash will be treated as an"      NL
         "### escape for the following character."                            NL
         ""                                                                   NL
+        "### Section for sending writes down a different route than reads."  NL
+        "[write-routes]"                                                     NL
+        "### Reads and writes can reach the same repository by different"    NL
+        "### URLs, so writes can need a stronger login than reads: a"        NL
+        "### password typed every time, another SSH key, or a security key"  NL
+        "### that has to be touched.  Each line is a route:"                 NL
+        "###   name = READ-URL-PREFIX WRITE-URL-PREFIX"                      NL
+        "### A repository whose root URL is at or below READ-URL-PREFIX is"  NL
+        "### read as usual, but commits, locks, unlocks and revision"        NL
+        "### property changes go through a second connection to the same"    NL
+        "### path below WRITE-URL-PREFIX, opened when it is first needed."   NL
+        "### Both URLs must reach the same repository: its UUID and root"    NL
+        "### URL are checked before anything is written.  Credentials used"  NL
+        "### on a write route are never saved, so a password is asked for"   NL
+        "### on every write, and a URL below WRITE-URL-PREFIX is redirected" NL
+        "### to READ-URL-PREFIX, so working copies only ever use read URLs." NL
+        "### An svn without write routes then only has the read login, and"  NL
+        "### can't write unless the server lets that login write."           NL
+        "### For example, to read over HTTPS and write over SSH with a key"  NL
+        "### named in ~/.ssh/config for the host alias svn-write:"           NL
+        "# example = https://svn.example.com/ svn+ssh://svn-write/"          NL
+        ""                                                                   NL
         "### Section for configuring miscellaneous Subversion options."      NL
         "[miscellany]"                                                       NL
         "### Set global-ignores to a set of whitespace-delimited globs"      NL

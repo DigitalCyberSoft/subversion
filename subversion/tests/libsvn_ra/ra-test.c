@@ -36,6 +36,10 @@
 #include "svn_cmdline.h"
 #include "svn_dirent_uri.h"
 #include "svn_hash.h"
+#include "svn_config.h"
+#include "svn_io.h"
+#include "svn_path.h"
+#include "svn_repos.h"
 
 #include "../svn_test.h"
 #include "../svn_test_fs.h"
@@ -1912,6 +1916,567 @@ test_get_deleted_rev_errors(const svn_test_opts_t *opts,
   return SVN_NO_ERROR;
 }
 
+/*** Write routes ***/
+
+/* Set *CONFIG to an empty client config, and *CFG to its 'config' file,
+   where write routes go. */
+static svn_error_t *
+make_route_config(apr_hash_t **config,
+                  svn_config_t **cfg,
+                  apr_pool_t *pool)
+{
+  SVN_ERR(svn_config_create2(cfg, FALSE, FALSE, pool));
+  *config = apr_hash_make(pool);
+  svn_hash_sets(*config, SVN_CONFIG_CATEGORY_CONFIG, *cfg);
+  return SVN_NO_ERROR;
+}
+
+/* Open *SESSION at URL with CONFIG.  With a tunnel baton B, the session
+   can also open svn+test:// tunnels to svnserve.  Use AUTH_BATON, or the
+   test suite's when it is NULL. */
+static svn_error_t *
+open_routed_session(svn_ra_session_t **session,
+                    const char *url,
+                    apr_hash_t *config,
+                    tunnel_baton_t *b,
+                    svn_auth_baton_t *auth_baton,
+                    apr_pool_t *pool)
+{
+  svn_ra_callbacks2_t *cbtable;
+
+  SVN_ERR(svn_ra_create_callbacks(&cbtable, pool));
+  if (auth_baton)
+    cbtable->auth_baton = auth_baton;
+  else
+    SVN_ERR(svn_test__init_auth_baton(&cbtable->auth_baton, pool));
+  if (b)
+    {
+      cbtable->check_tunnel_func = check_tunnel;
+      cbtable->open_tunnel_func = open_tunnel;
+      cbtable->tunnel_baton = b;
+    }
+  SVN_ERR(svn_ra_initialize(pool));
+
+  return svn_error_trace(svn_ra_open5(session, NULL, NULL, url, NULL,
+                                      cbtable, NULL, config, pool));
+}
+
+/* What record_commit() was told. */
+typedef struct commit_record_t
+{
+  svn_revnum_t revision;
+  const char *repos_root;
+  apr_pool_t *pool;
+} commit_record_t;
+
+/* Implements svn_commit_callback2_t. */
+static svn_error_t *
+record_commit(const svn_commit_info_t *commit_info,
+              void *baton,
+              apr_pool_t *pool)
+{
+  commit_record_t *record = baton;
+
+  record->revision = commit_info->revision;
+  record->repos_root = apr_pstrdup(record->pool, commit_info->repos_root);
+  return SVN_NO_ERROR;
+}
+
+/* Commit through SESSION a copy of the session URL at COPY_REV to DIR,
+   unless DIR is NULL, and an empty file FILE, unless FILE is NULL.  The
+   copy source is a read-route URL, so a write route has to move it.  Fill
+   RECORD from the commit callback. */
+static svn_error_t *
+routed_commit(commit_record_t *record,
+              svn_ra_session_t *session,
+              const char *dir,
+              svn_revnum_t copy_rev,
+              const char *file,
+              apr_pool_t *pool)
+{
+  const svn_delta_editor_t *editor;
+  void *edit_baton;
+  void *root_baton;
+  void *baton;
+  const char *session_url;
+
+  record->revision = SVN_INVALID_REVNUM;
+  record->repos_root = NULL;
+  record->pool = pool;
+
+  SVN_ERR(svn_ra_get_session_url(session, &session_url, pool));
+  SVN_ERR(svn_ra_get_commit_editor3(session, &editor, &edit_baton,
+                                    apr_hash_make(pool),
+                                    record_commit, record,
+                                    NULL, FALSE, pool));
+  SVN_ERR(editor->open_root(edit_baton, SVN_INVALID_REVNUM, pool,
+                            &root_baton));
+  if (dir)
+    {
+      SVN_ERR(editor->add_directory(dir, root_baton, session_url, copy_rev,
+                                    pool, &baton));
+      SVN_ERR(editor->close_directory(baton, pool));
+    }
+  if (file)
+    {
+      SVN_ERR(editor->add_file(file, root_baton, NULL, SVN_INVALID_REVNUM,
+                               pool, &baton));
+      SVN_ERR(editor->close_file(baton, NULL, pool));
+    }
+  SVN_ERR(editor->close_directory(root_baton, pool));
+
+  return svn_error_trace(editor->close_edit(edit_baton, pool));
+}
+
+/* Make REPOS accept revision property changes. */
+static svn_error_t *
+allow_revprop_changes(svn_repos_t *repos,
+                      apr_pool_t *pool)
+{
+  const char *hook = svn_repos_pre_revprop_change_hook(repos, pool);
+
+#ifdef WIN32
+  SVN_ERR(svn_io_file_create(apr_pstrcat(pool, hook, ".bat", SVN_VA_NULL),
+                             "@exit 0" APR_EOL_STR, pool));
+#else
+  SVN_ERR(svn_io_file_create(hook, "#!/bin/sh\nexit 0\n", pool));
+  SVN_ERR(svn_io_set_file_executable(hook, TRUE, FALSE, pool));
+#endif
+
+  return SVN_NO_ERROR;
+}
+
+/* Writes take the write route, to a second repository with the same
+   UUID, while reads stay on the read route. */
+static svn_error_t *
+write_route_commit(const svn_test_opts_t *opts,
+                   apr_pool_t *pool)
+{
+  svn_repos_t *read_repos;
+  svn_repos_t *write_repos;
+  svn_fs_t *read_fs;
+  svn_fs_t *write_fs;
+  const char *read_url;
+  const char *write_url;
+  const char *uuid;
+  apr_hash_t *config;
+  svn_config_t *cfg;
+  svn_ra_session_t *session;
+  commit_record_t record;
+  svn_revnum_t youngest;
+  svn_revnum_t lock_rev = 1;
+  svn_fs_root_t *root;
+  svn_node_kind_t kind;
+  struct lock_baton_t lb;
+  struct lock_result_t *result;
+  apr_hash_t *targets;
+  svn_lock_t *lock;
+  svn_string_t *value;
+
+  SVN_ERR(svn_test__create_repos2(&read_repos, &read_url, NULL,
+                                  "ra-test-write-route-commit-r", opts,
+                                  pool, pool));
+  SVN_ERR(svn_test__create_repos2(&write_repos, &write_url, NULL,
+                                  "ra-test-write-route-commit-w", opts,
+                                  pool, pool));
+  read_fs = svn_repos_fs(read_repos);
+  write_fs = svn_repos_fs(write_repos);
+  SVN_ERR(svn_fs_get_uuid(read_fs, &uuid, pool));
+  SVN_ERR(svn_fs_set_uuid(write_fs, uuid, pool));
+  SVN_ERR(allow_revprop_changes(write_repos, pool));
+
+  /* The longer of two read prefixes that cover the repository wins; the
+     shorter one would fail. */
+  SVN_ERR(make_route_config(&config, &cfg, pool));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "short",
+                 apr_psprintf(pool, "%s %s/nowhere",
+                              svn_uri_dirname(read_url, pool), write_url));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s", read_url, write_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+
+  /* A commit lands in the write repository, but reports the read route's
+     root, and reads still come from the read repository. */
+  SVN_ERR(routed_commit(&record, session, "A", 0, "iota", pool));
+  SVN_TEST_INT_ASSERT(record.revision, 1);
+  SVN_TEST_STRING_ASSERT(record.repos_root, read_url);
+  SVN_ERR(svn_fs_youngest_rev(&youngest, write_fs, pool));
+  SVN_TEST_INT_ASSERT(youngest, 1);
+  SVN_ERR(svn_fs_youngest_rev(&youngest, read_fs, pool));
+  SVN_TEST_INT_ASSERT(youngest, 0);
+  SVN_ERR(svn_ra_get_latest_revnum(session, &youngest, pool));
+  SVN_TEST_INT_ASSERT(youngest, 0);
+
+  /* After a reparent, writes land at the same path below the write root. */
+  SVN_ERR(svn_ra_reparent(session,
+                          svn_path_url_add_component2(read_url, "A", pool),
+                          pool));
+  SVN_ERR(routed_commit(&record, session, "B", 1, NULL, pool));
+  SVN_TEST_INT_ASSERT(record.revision, 2);
+  SVN_ERR(svn_fs_revision_root(&root, write_fs, 2, pool));
+  SVN_ERR(svn_fs_check_path(&kind, root, "/A/B", pool));
+  SVN_TEST_ASSERT(kind == svn_node_dir);
+  SVN_ERR(svn_ra_reparent(session, read_url, pool));
+
+  /* Locks and unlocks are writes. */
+  lb.results = apr_hash_make(pool);
+  lb.pool = pool;
+  targets = apr_hash_make(pool);
+  svn_hash_sets(targets, "iota", &lock_rev);
+  SVN_ERR(svn_ra_lock(session, targets, "routed", FALSE, lock_cb, &lb,
+                      pool));
+  result = svn_hash_gets(lb.results, "iota");
+  SVN_TEST_ASSERT(result && result->lock && !result->err);
+  SVN_ERR(svn_fs_get_lock(&lock, write_fs, "/iota", pool));
+  SVN_TEST_ASSERT(lock);
+  SVN_TEST_STRING_ASSERT(lock->token, result->lock->token);
+
+  targets = apr_hash_make(pool);
+  svn_hash_sets(targets, "iota", result->lock->token);
+  lb.results = apr_hash_make(pool);
+  SVN_ERR(svn_ra_unlock(session, targets, FALSE, lock_cb, &lb, pool));
+  result = svn_hash_gets(lb.results, "iota");
+  SVN_TEST_ASSERT(result && !result->err);
+  SVN_ERR(svn_fs_get_lock(&lock, write_fs, "/iota", pool));
+  SVN_TEST_ASSERT(! lock);
+
+  /* So are revision property changes. */
+  SVN_ERR(svn_ra_change_rev_prop2(session, 0, "test:route", NULL,
+                                  svn_string_create("write", pool), pool));
+  SVN_ERR(svn_fs_revision_prop2(&value, write_fs, 0, "test:route", TRUE,
+                                pool, pool));
+  SVN_TEST_ASSERT(value);
+  SVN_TEST_STRING_ASSERT(value->data, "write");
+  SVN_ERR(svn_fs_revision_prop2(&value, read_fs, 0, "test:route", TRUE,
+                                pool, pool));
+  SVN_TEST_ASSERT(! value);
+
+  return SVN_NO_ERROR;
+}
+
+/* A write route must reach the same repository, at its root, and a bad
+   route stops writes without getting in the way of reads. */
+static svn_error_t *
+write_route_errors(const svn_test_opts_t *opts,
+                   apr_pool_t *pool)
+{
+  svn_repos_t *read_repos;
+  svn_repos_t *write_repos;
+  const char *read_url;
+  const char *write_url;
+  const char *uuid;
+  apr_hash_t *config;
+  svn_config_t *cfg;
+  svn_ra_session_t *session;
+  commit_record_t record;
+  svn_revnum_t youngest;
+
+  SVN_ERR(svn_test__create_repos2(&read_repos, &read_url, NULL,
+                                  "ra-test-write-route-errors-r", opts,
+                                  pool, pool));
+  SVN_ERR(svn_test__create_repos2(&write_repos, &write_url, NULL,
+                                  "ra-test-write-route-errors-w", opts,
+                                  pool, pool));
+  SVN_ERR(make_route_config(&config, &cfg, pool));
+
+  /* Another repository (another UUID). */
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s", read_url, write_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_TEST_ASSERT_ERROR(routed_commit(&record, session, "A", 0, NULL, pool),
+                        SVN_ERR_RA_UUID_MISMATCH);
+
+  /* The same repository, but the route doesn't map root to root. */
+  SVN_ERR(svn_fs_get_uuid(svn_repos_fs(read_repos), &uuid, pool));
+  SVN_ERR(svn_fs_set_uuid(svn_repos_fs(write_repos), uuid, pool));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s/sub", read_url, write_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_TEST_ASSERT_ERROR(routed_commit(&record, session, "A", 0, NULL, pool),
+                        SVN_ERR_BAD_CONFIG_VALUE);
+
+  /* Malformed routes: reads still work, writes don't. */
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test", read_url);
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_ERR(svn_ra_get_latest_revnum(session, &youngest, pool));
+  SVN_TEST_INT_ASSERT(youngest, 0);
+  SVN_TEST_ASSERT_ERROR(routed_commit(&record, session, "A", 0, NULL, pool),
+                        SVN_ERR_BAD_CONFIG_VALUE);
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s bogus", read_url, write_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_TEST_ASSERT_ERROR(routed_commit(&record, session, "A", 0, NULL, pool),
+                        SVN_ERR_BAD_CONFIG_VALUE);
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s", read_url, read_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_ERR(svn_ra_get_latest_revnum(session, &youngest, pool));
+  SVN_TEST_ASSERT_ERROR(routed_commit(&record, session, "A", 0, NULL, pool),
+                        SVN_ERR_BAD_CONFIG_VALUE);
+
+  /* A route for other repositories leaves this one's writes alone. */
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s/elsewhere %s/elsewhere",
+                              read_url, write_url));
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, NULL, pool));
+  SVN_ERR(routed_commit(&record, session, "A", 0, NULL, pool));
+  SVN_TEST_INT_ASSERT(record.revision, 1);
+  SVN_ERR(svn_fs_youngest_rev(&youngest, svn_repos_fs(read_repos), pool));
+  SVN_TEST_INT_ASSERT(youngest, 1);
+  SVN_ERR(svn_fs_youngest_rev(&youngest, svn_repos_fs(write_repos), pool));
+  SVN_TEST_INT_ASSERT(youngest, 0);
+
+  return SVN_NO_ERROR;
+}
+
+/* The intended use: one repository, read through file:// and written
+   through svnserve over a tunnel, which is only opened to write. */
+static svn_error_t *
+write_route_tunnel(const svn_test_opts_t *opts,
+                   apr_pool_t *pool)
+{
+  tunnel_baton_t *b = apr_pcalloc(pool, sizeof(*b));
+  apr_pool_t *scratch_pool = svn_pool_create(pool);
+  const char repos_name[] = "test-write-route-tunnel";
+  svn_repos_t *repos;
+  const char *cwd;
+  const char *read_prefix;
+  const char *read_url;
+  const char *read_root;
+  apr_hash_t *config;
+  svn_config_t *cfg;
+  svn_ra_session_t *session;
+  commit_record_t record;
+  svn_revnum_t youngest;
+  svn_revnum_t lock_rev = 1;
+  svn_node_kind_t kind;
+  struct lock_baton_t lb;
+  struct lock_result_t *result;
+  apr_hash_t *targets;
+  svn_string_t *value;
+
+  b->magic = TUNNEL_MAGIC;
+
+  SVN_ERR(svn_test__create_repos(&repos, repos_name, opts, scratch_pool));
+  SVN_ERR(allow_revprop_changes(repos, scratch_pool));
+  /* Close the repository before svnserve opens it (see
+     tunnel_run_checkout). */
+  svn_pool_clear(scratch_pool);
+
+  /* svnserve serves the current directory, as svn+test://localhost. */
+  SVN_ERR(svn_dirent_get_absolute(&cwd, "", pool));
+  SVN_ERR(svn_uri_get_file_url_from_dirent(&read_prefix, cwd, pool));
+  read_url = svn_path_url_add_component2(read_prefix, repos_name, pool);
+  SVN_ERR(make_route_config(&config, &cfg, pool));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s svn+test://localhost", read_prefix));
+
+  SVN_ERR(open_routed_session(&session, read_url, config, b, NULL, pool));
+  SVN_ERR(svn_ra_get_latest_revnum(session, &youngest, pool));
+  SVN_TEST_INT_ASSERT(youngest, 0);
+  SVN_TEST_INT_ASSERT(b->open_count, 0);
+
+  /* The commit opens the tunnel; the read route then sees it. */
+  SVN_ERR(routed_commit(&record, session, "A", 0, "iota", pool));
+  SVN_TEST_INT_ASSERT(b->open_count, 1);
+  SVN_TEST_INT_ASSERT(record.revision, 1);
+  SVN_ERR(svn_ra_get_repos_root2(session, &read_root, pool));
+  SVN_TEST_STRING_ASSERT(record.repos_root, read_root);
+  SVN_ERR(svn_ra_check_path(session, "A", 1, &kind, pool));
+  SVN_TEST_ASSERT(kind == svn_node_dir);
+
+  /* Later writes reuse the same tunnel. */
+  lb.results = apr_hash_make(pool);
+  lb.pool = pool;
+  targets = apr_hash_make(pool);
+  svn_hash_sets(targets, "iota", &lock_rev);
+  SVN_ERR(svn_ra_lock(session, targets, "routed", FALSE, lock_cb, &lb,
+                      pool));
+  SVN_ERR(expect_lock("iota", lb.results, session, pool));
+  result = svn_hash_gets(lb.results, "iota");
+
+  targets = apr_hash_make(pool);
+  svn_hash_sets(targets, "iota", result->lock->token);
+  lb.results = apr_hash_make(pool);
+  SVN_ERR(svn_ra_unlock(session, targets, FALSE, lock_cb, &lb, pool));
+  SVN_ERR(expect_unlock("iota", lb.results, session, pool));
+
+  SVN_ERR(svn_ra_change_rev_prop2(session, 1, "test:route", NULL,
+                                  svn_string_create("tunnel", pool), pool));
+  SVN_ERR(svn_ra_rev_prop(session, 1, "test:route", &value, pool));
+  SVN_TEST_ASSERT(value);
+  SVN_TEST_STRING_ASSERT(value->data, "tunnel");
+  SVN_TEST_INT_ASSERT(b->open_count, 1);
+
+  return SVN_NO_ERROR;
+}
+
+/* URLs on a write route redirect to its read route, so no working copy
+   or session ends up using a write URL. */
+static svn_error_t *
+write_route_redirect(const svn_test_opts_t *opts,
+                     apr_pool_t *pool)
+{
+  const char *read_url;
+  const char *corrected_url;
+  const char *redirect_url;
+  apr_hash_t *config;
+  svn_config_t *cfg;
+  svn_ra_callbacks2_t *cbtable;
+  svn_ra_session_t *session;
+
+  SVN_ERR(svn_test__create_repos2(NULL, &read_url, NULL,
+                                  "ra-test-write-route-redirect", opts,
+                                  pool, pool));
+  SVN_ERR(make_route_config(&config, &cfg, pool));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s svn+test://writehost/repos",
+                              read_url));
+  SVN_ERR(svn_ra_create_callbacks(&cbtable, pool));
+  SVN_ERR(svn_test__init_auth_baton(&cbtable->auth_baton, pool));
+  SVN_ERR(svn_ra_initialize(pool));
+
+  /* The caller gets the read URL of the same path, without a session. */
+  session = (void *)cbtable;
+  SVN_ERR(svn_ra_open5(&session, &corrected_url, &redirect_url,
+                       "svn+test://writehost/repos/A/B", NULL,
+                       cbtable, NULL, config, pool));
+  SVN_TEST_ASSERT(session == NULL);
+  SVN_TEST_STRING_ASSERT(corrected_url,
+                         svn_path_url_add_component2(read_url, "A/B", pool));
+  SVN_TEST_STRING_ASSERT(redirect_url, corrected_url);
+
+  /* A caller that can't follow redirects gets an error. */
+  SVN_TEST_ASSERT_ERROR(svn_ra_open5(&session, NULL, NULL,
+                                     "svn+test://writehost/repos", NULL,
+                                     cbtable, NULL, config, pool),
+                        SVN_ERR_RA_SESSION_URL_MISMATCH);
+
+  /* Read URLs open as usual, even when another route writes to them, so
+     routes that point at each other can't loop. */
+  SVN_ERR(svn_ra_open5(&session, &corrected_url, NULL, read_url, NULL,
+                       cbtable, NULL, config, pool));
+  SVN_TEST_ASSERT(session != NULL);
+  SVN_TEST_ASSERT(corrected_url == NULL);
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "back",
+                 apr_psprintf(pool, "svn+test://writehost/repos %s",
+                              read_url));
+  SVN_ERR(svn_ra_open5(&session, &corrected_url, NULL, read_url, NULL,
+                       cbtable, NULL, config, pool));
+  SVN_TEST_ASSERT(session != NULL);
+  SVN_TEST_ASSERT(corrected_url == NULL);
+
+  return SVN_NO_ERROR;
+}
+
+/* A username provider that offers "jrandom" and counts how often it is
+   asked to save it, in the int its baton points to. */
+static svn_error_t *
+counting_first_creds(void **credentials,
+                     void **iter_baton,
+                     void *provider_baton,
+                     apr_hash_t *parameters,
+                     const char *realmstring,
+                     apr_pool_t *pool)
+{
+  svn_auth_cred_username_t *creds = apr_pcalloc(pool, sizeof(*creds));
+
+  creds->username = "jrandom";
+  creds->may_save = TRUE;
+  *credentials = creds;
+  *iter_baton = NULL;
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+counting_save_creds(svn_boolean_t *saved,
+                    void *credentials,
+                    void *provider_baton,
+                    apr_hash_t *parameters,
+                    const char *realmstring,
+                    apr_pool_t *pool)
+{
+  int *saves = provider_baton;
+
+  ++*saves;
+  *saved = TRUE;
+  return SVN_NO_ERROR;
+}
+
+static const svn_auth_provider_t counting_provider =
+  {
+    SVN_AUTH_CRED_USERNAME,
+    counting_first_creds,
+    NULL,
+    counting_save_creds
+  };
+
+/* Set *AUTH_BATON to one whose only provider counts saves in *SAVES. */
+static void
+open_counting_auth(svn_auth_baton_t **auth_baton,
+                   int *saves,
+                   apr_pool_t *pool)
+{
+  apr_array_header_t *providers
+    = apr_array_make(pool, 1, sizeof(svn_auth_provider_object_t *));
+  svn_auth_provider_object_t *provider = apr_pcalloc(pool, sizeof(*provider));
+
+  provider->vtable = &counting_provider;
+  provider->provider_baton = saves;
+  APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+  svn_auth_open(auth_baton, providers, pool);
+}
+
+/* A write route never saves the credentials it uses, so it leaves nothing
+   behind that an svn without write routes could use. */
+static svn_error_t *
+write_route_saves_nothing(const svn_test_opts_t *opts,
+                          apr_pool_t *pool)
+{
+  svn_repos_t *read_repos;
+  svn_repos_t *write_repos;
+  const char *read_url;
+  const char *write_url;
+  const char *uuid;
+  apr_hash_t *config;
+  svn_config_t *cfg;
+  svn_auth_baton_t *auth_baton;
+  svn_ra_session_t *session;
+  commit_record_t record;
+  int routed_saves = 0;
+  int direct_saves = 0;
+
+  SVN_ERR(svn_test__create_repos2(&read_repos, &read_url, NULL,
+                                  "ra-test-write-route-saves-r", opts,
+                                  pool, pool));
+  SVN_ERR(svn_test__create_repos2(&write_repos, &write_url, NULL,
+                                  "ra-test-write-route-saves-w", opts,
+                                  pool, pool));
+  SVN_ERR(svn_fs_get_uuid(svn_repos_fs(read_repos), &uuid, pool));
+  SVN_ERR(svn_fs_set_uuid(svn_repos_fs(write_repos), uuid, pool));
+  SVN_ERR(make_route_config(&config, &cfg, pool));
+  svn_config_set(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES, "test",
+                 apr_psprintf(pool, "%s %s", read_url, write_url));
+
+  open_counting_auth(&auth_baton, &routed_saves, pool);
+  SVN_ERR(open_routed_session(&session, read_url, config, NULL, auth_baton,
+                              pool));
+  SVN_ERR(routed_commit(&record, session, "A", 0, NULL, pool));
+  SVN_TEST_INT_ASSERT(record.revision, 1);
+  SVN_TEST_INT_ASSERT(routed_saves, 0);
+
+  /* Without the route, the same commit saves the username, so the check
+     above means something. */
+  open_counting_auth(&auth_baton, &direct_saves, pool);
+  SVN_ERR(open_routed_session(&session, read_url, NULL, NULL, auth_baton,
+                              pool));
+  SVN_ERR(routed_commit(&record, session, "A", 0, NULL, pool));
+  SVN_TEST_INT_ASSERT(record.revision, 1);
+  SVN_TEST_INT_ASSERT(direct_saves, 1);
+
+  return SVN_NO_ERROR;
+}
+
 
 /* The test table.  */
 
@@ -1952,6 +2517,16 @@ static struct svn_test_descriptor_t test_funcs[] =
                        "test get-deleted-rev no delete"),
     SVN_TEST_OPTS_PASS(test_get_deleted_rev_errors,
                        "test get-deleted-rev errors"),
+    SVN_TEST_OPTS_PASS(write_route_commit,
+                       "write routes: writes go to the write URL"),
+    SVN_TEST_OPTS_PASS(write_route_errors,
+                       "write routes: wrong or bad routes stop writes"),
+    SVN_TEST_OPTS_PASS(write_route_tunnel,
+                       "write routes: read via file://, write via svn+"),
+    SVN_TEST_OPTS_PASS(write_route_redirect,
+                       "write routes: write URLs redirect to read URLs"),
+    SVN_TEST_OPTS_PASS(write_route_saves_nothing,
+                       "write routes: write credentials are never saved"),
     SVN_TEST_NULL
   };
 

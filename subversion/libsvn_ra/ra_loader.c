@@ -259,15 +259,19 @@ svn_ra_create_callbacks(svn_ra_callbacks2_t **callbacks,
   return SVN_NO_ERROR;
 }
 
-svn_error_t *svn_ra_open5(svn_ra_session_t **session_p,
-                          const char **corrected_url_p,
-                          const char **redirect_url_p,
-                          const char *repos_URL,
-                          const char *uuid,
-                          const svn_ra_callbacks2_t *callbacks,
-                          void *callback_baton,
-                          apr_hash_t *config,
-                          apr_pool_t *pool)
+/* Implement svn_ra_open5().  With NO_AUTH_CACHE, never save the
+   credentials this session uses. */
+static svn_error_t *
+ra_open(svn_ra_session_t **session_p,
+        const char **corrected_url_p,
+        const char **redirect_url_p,
+        const char *repos_URL,
+        const char *uuid,
+        const svn_ra_callbacks2_t *callbacks,
+        void *callback_baton,
+        apr_hash_t *config,
+        svn_boolean_t no_auth_cache,
+        apr_pool_t *pool)
 {
   apr_pool_t *sesspool = svn_pool_create(pool);
   apr_pool_t *scratch_pool = svn_pool_create(sesspool);
@@ -302,6 +306,10 @@ svn_error_t *svn_ra_open5(svn_ra_session_t **session_p,
                                         sesspool, scratch_pool));
   else
     auth_baton = NULL;
+
+  /* A session auth baton has its own parameters, so this is per session. */
+  if (auth_baton && no_auth_cache)
+    svn_auth_set_parameter(auth_baton, SVN_AUTH_PARAM_NO_AUTH_CACHE, "");
 
 #ifdef CHOOSABLE_DAV_MODULE
   if (config)
@@ -383,6 +391,18 @@ svn_error_t *svn_ra_open5(svn_ra_session_t **session_p,
   session->cancel_baton = callback_baton;
   session->vtable = vtable;
   session->pool = sesspool;
+  session->callbacks = callbacks;
+  session->callback_baton = callback_baton;
+
+  /* A write-route session is opened later with this config, so keep a copy
+     of it, as the RA layers do: the caller's needn't outlive the session. */
+  if (config)
+    {
+      svn_config_t *cfg = svn_hash_gets(config, SVN_CONFIG_CATEGORY_CONFIG);
+
+      if (cfg && svn_config_has_section(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES))
+        SVN_ERR(svn_config_copy_config(&session->config, config, sesspool));
+    }
 
   /* Ask the library to open the session. */
   err = vtable->open_session(session, corrected_url_p, redirect_url_p,
@@ -442,6 +462,649 @@ svn_error_t *svn_ra_open5(svn_ra_session_t **session_p,
   return SVN_NO_ERROR;
 }
 
+/*** Write routes (SVN_CONFIG_SECTION_WRITE_ROUTES) ***/
+
+/* Write routes are built so that an svn without them (stock Subversion,
+   or a distribution update that replaces this build) only ever has a
+   route's read login to work with:
+     - a URL on a write route is answered like a redirect to its read
+       route (svn_ra_open5()), so no working copy ends up on a write URL;
+     - a write session never saves the credentials it uses (ra_open()
+       with NO_AUTH_CACHE), so none are left on disk for the read URL. */
+
+/* A route that sends writes for repositories at or below READ_PREFIX to
+   the same path below WRITE_PREFIX.  Both prefixes are canonical URLs. */
+struct svn_ra__write_route_t
+{
+  const char *name;
+  const char *read_prefix;
+  const char *write_prefix;
+};
+
+/* Return URL, which must be canonical, moved to the same path below
+   TO_PREFIX, or NULL if URL isn't at or below FROM_PREFIX. */
+static const char *
+move_url(const char *url,
+         const char *from_prefix,
+         const char *to_prefix,
+         apr_pool_t *result_pool)
+{
+  const char *relpath = svn_uri_skip_ancestor(from_prefix, url, result_pool);
+
+  if (! relpath)
+    return NULL;
+
+  return svn_path_url_add_component2(to_prefix, relpath, result_pool);
+}
+
+/* Parse the route NAME = VALUE into *ROUTE. */
+static svn_error_t *
+parse_write_route(struct svn_ra__write_route_t **route,
+                  const char *name,
+                  const char *value,
+                  apr_pool_t *result_pool,
+                  apr_pool_t *scratch_pool)
+{
+  apr_array_header_t *words = svn_cstring_split(value, " \t", TRUE,
+                                                scratch_pool);
+  const char *prefix[2];
+  int i;
+
+  if (words->nelts != 2)
+    return svn_error_createf(SVN_ERR_BAD_CONFIG_VALUE, NULL,
+                             _("Write route '%s' must be a read URL prefix "
+                               "and a write URL prefix"), name);
+
+  for (i = 0; i < 2; i++)
+    {
+      const char *url = APR_ARRAY_IDX(words, i, const char *);
+
+      if (! svn_path_is_url(url))
+        return svn_error_createf(SVN_ERR_BAD_CONFIG_VALUE, NULL,
+                                 _("Write route '%s': '%s' is not a URL"),
+                                 name, url);
+      SVN_ERR(svn_uri_canonicalize_safe(&prefix[i], NULL, url, result_pool,
+                                        scratch_pool));
+    }
+
+  if (strcmp(prefix[0], prefix[1]) == 0)
+    return svn_error_createf(SVN_ERR_BAD_CONFIG_VALUE, NULL,
+                             _("Write route '%s' has the same URL for reads "
+                               "and writes"), name);
+
+  *route = apr_pcalloc(result_pool, sizeof(**route));
+  (*route)->name = apr_pstrdup(result_pool, name);
+  (*route)->read_prefix = prefix[0];
+  (*route)->write_prefix = prefix[1];
+  return SVN_NO_ERROR;
+}
+
+/* Baton for find_read_route() and find_write_url_route(). */
+typedef struct find_route_baton_t
+{
+  const char *url;
+  struct svn_ra__write_route_t *route;
+  svn_boolean_t read_url;   /* some route reads from URL */
+  svn_error_t *err;
+  apr_pool_t *result_pool;
+} find_route_baton_t;
+
+/* Implements svn_config_enumerator2_t.  Keep the route NAME = VALUE in
+   BATON when its read prefix covers BATON->url, a repository root, more
+   closely than the route kept so far.  On a bad route, set BATON->err and
+   stop. */
+static svn_boolean_t
+find_read_route(const char *name,
+                const char *value,
+                void *baton,
+                apr_pool_t *pool)
+{
+  find_route_baton_t *b = baton;
+  struct svn_ra__write_route_t *route;
+
+  b->err = parse_write_route(&route, name, value, b->result_pool, pool);
+  if (b->err)
+    return FALSE;
+
+  if (svn_uri__is_ancestor(route->read_prefix, b->url)
+      && (! b->route
+          || strlen(route->read_prefix) > strlen(b->route->read_prefix)))
+    b->route = route;
+
+  return TRUE;
+}
+
+/* Implements svn_config_enumerator2_t.  Note in BATON when the route
+   NAME = VALUE reads from BATON->url, and otherwise keep it when its write
+   prefix covers BATON->url more closely than the route kept so far.  Bad
+   routes are skipped: they stop writes, which report them, not reads. */
+static svn_boolean_t
+find_write_url_route(const char *name,
+                     const char *value,
+                     void *baton,
+                     apr_pool_t *pool)
+{
+  find_route_baton_t *b = baton;
+  struct svn_ra__write_route_t *route;
+  svn_error_t *err = parse_write_route(&route, name, value, b->result_pool,
+                                       pool);
+
+  if (err)
+    {
+      svn_error_clear(err);
+      return TRUE;
+    }
+
+  if (svn_uri__is_ancestor(route->read_prefix, b->url))
+    b->read_url = TRUE;
+  else if (svn_uri__is_ancestor(route->write_prefix, b->url)
+           && (! b->route
+               || strlen(route->write_prefix)
+                  > strlen(b->route->write_prefix)))
+    b->route = route;
+
+  return TRUE;
+}
+
+svn_error_t *svn_ra_open5(svn_ra_session_t **session_p,
+                          const char **corrected_url_p,
+                          const char **redirect_url_p,
+                          const char *repos_URL,
+                          const char *uuid,
+                          const svn_ra_callbacks2_t *callbacks,
+                          void *callback_baton,
+                          apr_hash_t *config,
+                          apr_pool_t *pool)
+{
+  svn_config_t *cfg = config ? svn_hash_gets(config,
+                                             SVN_CONFIG_CATEGORY_CONFIG)
+                             : NULL;
+
+  /* A URL on a write route is answered like a redirect to its read route,
+     so working copies and sessions only ever use read URLs.  A URL that
+     any route reads from is never redirected, so routes can't loop. */
+  if (cfg && svn_config_has_section(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES)
+      && svn_path_is_url(repos_URL))
+    {
+      apr_pool_t *scratch_pool = svn_pool_create(pool);
+      find_route_baton_t b = { 0 };
+      const char *read_url = NULL;
+      svn_error_t *err;
+
+      b.result_pool = scratch_pool;
+      err = svn_uri_canonicalize_safe(&b.url, NULL, repos_URL, scratch_pool,
+                                      scratch_pool);
+      if (err)
+        svn_error_clear(err);
+      else
+        svn_config_enumerate2(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES,
+                              find_write_url_route, &b, scratch_pool);
+
+      if (b.route && ! b.read_url)
+        {
+          read_url = move_url(b.url, b.route->write_prefix,
+                              b.route->read_prefix, pool);
+          if (! corrected_url_p)
+            err = svn_error_createf(SVN_ERR_RA_SESSION_URL_MISMATCH, NULL,
+                                    _("'%s' is the write URL of write route "
+                                      "'%s'; use its read URL '%s'"),
+                                    repos_URL, b.route->name, read_url);
+        }
+      svn_pool_destroy(scratch_pool);
+
+      if (read_url)
+        {
+          if (err)
+            return svn_error_trace(err);
+          *session_p = NULL;
+          *corrected_url_p = read_url;
+          if (redirect_url_p)
+            *redirect_url_p = read_url;
+          return SVN_NO_ERROR;
+        }
+    }
+
+  return svn_error_trace(ra_open(session_p, corrected_url_p, redirect_url_p,
+                                 repos_URL, uuid, callbacks, callback_baton,
+                                 config, FALSE, pool));
+}
+
+/* Set *WRITE_SESSION to the session SESSION's writes go through.  That is
+   SESSION itself unless a write route covers its repository; then it is a
+   session on the same repository below the route's write prefix, opened
+   when first needed and kept at the path SESSION is at.  Routes are only
+   looked at here, so a bad route never gets in the way of reads. */
+static svn_error_t *
+get_write_session(svn_ra_session_t **write_session,
+                  svn_ra_session_t *session,
+                  apr_pool_t *scratch_pool)
+{
+  const struct svn_ra__write_route_t *route;
+  const char *session_url;
+  const char *write_url;
+
+  if (! session->write_route_checked)
+    {
+      svn_config_t *cfg = session->config
+                          ? svn_hash_gets(session->config,
+                                          SVN_CONFIG_CATEGORY_CONFIG)
+                          : NULL;
+
+      if (cfg && svn_config_has_section(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES))
+        {
+          find_route_baton_t b = { 0 };
+
+          SVN_ERR(session->vtable->get_repos_root(session, &b.url,
+                                                  scratch_pool));
+          b.result_pool = session->pool;
+          svn_config_enumerate2(cfg, SVN_CONFIG_SECTION_WRITE_ROUTES,
+                                find_read_route, &b, scratch_pool);
+          SVN_ERR(b.err);
+          session->write_route = b.route;
+        }
+      session->write_route_checked = TRUE;
+    }
+
+  route = session->write_route;
+  if (! route)
+    {
+      *write_session = session;
+      return SVN_NO_ERROR;
+    }
+
+  SVN_ERR(session->vtable->get_session_url(session, &session_url,
+                                           scratch_pool));
+  write_url = move_url(session_url, route->read_prefix, route->write_prefix,
+                       scratch_pool);
+  SVN_ERR_ASSERT(write_url != NULL);
+
+  if (! session->write_session)
+    {
+      svn_ra_session_t *ws;
+      const char *uuid;
+      const char *read_root;
+      const char *write_root;
+      const char *expected_root;
+      svn_error_t *err;
+
+      SVN_ERR(session->vtable->get_uuid(session, &uuid, scratch_pool));
+      SVN_ERR(session->vtable->get_repos_root(session, &read_root,
+                                              scratch_pool));
+
+      /* Passing the UUID makes ra_open() check it.  The write session never
+         saves its credentials (see "Write routes" above). */
+      err = ra_open(&ws, NULL, NULL, write_url, uuid,
+                    session->callbacks, session->callback_baton,
+                    session->config, TRUE, session->pool);
+      if (err && err->apr_err == SVN_ERR_RA_UUID_MISMATCH)
+        return svn_error_quick_wrapf(err,
+                                     _("Write route '%s' leads to a different "
+                                       "repository than '%s'"),
+                                     route->name, read_root);
+      if (err)
+        return svn_error_quick_wrapf(err, _("Can't open write route '%s'"),
+                                     route->name);
+
+      /* A write session never routes its own writes. */
+      ws->write_route_checked = TRUE;
+
+      /* Paths below the two sessions only match if the route maps the
+         repository root onto the root the write session found. */
+      SVN_ERR(ws->vtable->get_repos_root(ws, &write_root, scratch_pool));
+      expected_root = move_url(read_root, route->read_prefix,
+                               route->write_prefix, scratch_pool);
+      if (strcmp(write_root, expected_root) != 0)
+        {
+          err = svn_error_createf(SVN_ERR_BAD_CONFIG_VALUE, NULL,
+                                  _("Write route '%s' maps repository root "
+                                    "'%s' to '%s', but that repository's root "
+                                    "is '%s'"),
+                                  route->name, read_root, expected_root,
+                                  write_root);
+          svn_pool_destroy(ws->pool);
+          return err;
+        }
+
+      session->write_session = ws;
+    }
+  else
+    {
+      const char *current_url;
+
+      SVN_ERR(session->write_session->vtable->get_session_url(
+                session->write_session, &current_url, scratch_pool));
+      if (strcmp(current_url, write_url) != 0)
+        SVN_ERR(svn_ra_reparent(session->write_session, write_url,
+                                scratch_pool));
+    }
+
+  *write_session = session->write_session;
+  return SVN_NO_ERROR;
+}
+
+/* Baton for route_commit_callback(). */
+typedef struct route_commit_baton_t
+{
+  svn_commit_callback2_t callback;
+  void *baton;
+  const struct svn_ra__write_route_t *route;
+} route_commit_baton_t;
+
+/* Implements svn_commit_callback2_t.  Report a commit made through a
+   write route with the repository root URL its reads use. */
+static svn_error_t *
+route_commit_callback(const svn_commit_info_t *commit_info,
+                      void *baton,
+                      apr_pool_t *pool)
+{
+  route_commit_baton_t *b = baton;
+  svn_commit_info_t *info = svn_commit_info_dup(commit_info, pool);
+
+  if (info->repos_root)
+    {
+      const char *read_root = move_url(info->repos_root,
+                                       b->route->write_prefix,
+                                       b->route->read_prefix, pool);
+
+      if (read_root)
+        info->repos_root = read_root;
+    }
+
+  return svn_error_trace(b->callback(info, b->baton, pool));
+}
+
+/* Make *CALLBACK and *BATON report through route_commit_callback() for
+   ROUTE, unless *CALLBACK is NULL. */
+static void
+route_commit_callback_wrap(svn_commit_callback2_t *callback,
+                           void **baton,
+                           const struct svn_ra__write_route_t *route,
+                           apr_pool_t *result_pool)
+{
+  route_commit_baton_t *b;
+
+  if (! *callback)
+    return;
+
+  b = apr_palloc(result_pool, sizeof(*b));
+  b->callback = *callback;
+  b->baton = *baton;
+  b->route = route;
+  *callback = route_commit_callback;
+  *baton = b;
+}
+
+/* The route editor drives a write-route session's commit editor and moves
+   copy sources from read-route URLs to write-route URLs on the way.  This
+   is its edit baton. */
+typedef struct route_edit_baton_t
+{
+  const svn_delta_editor_t *editor;
+  void *edit_baton;
+  const struct svn_ra__write_route_t *route;
+} route_edit_baton_t;
+
+/* A directory or file baton of the route editor. */
+typedef struct route_node_baton_t
+{
+  route_edit_baton_t *eb;
+  void *baton;
+} route_node_baton_t;
+
+static void *
+route_node(route_edit_baton_t *eb, void *baton, apr_pool_t *result_pool)
+{
+  route_node_baton_t *nb = apr_palloc(result_pool, sizeof(*nb));
+
+  nb->eb = eb;
+  nb->baton = baton;
+  return nb;
+}
+
+/* Return COPYFROM_PATH moved from EB's read route to its write route, or
+   unchanged when it isn't a URL below the read prefix. */
+static const char *
+route_copyfrom(route_edit_baton_t *eb,
+               const char *copyfrom_path,
+               apr_pool_t *result_pool)
+{
+  const char *url;
+  const char *moved;
+  svn_error_t *err;
+
+  if (! copyfrom_path || ! svn_path_is_url(copyfrom_path))
+    return copyfrom_path;
+
+  err = svn_uri_canonicalize_safe(&url, NULL, copyfrom_path, result_pool,
+                                  result_pool);
+  if (err)
+    {
+      svn_error_clear(err);
+      return copyfrom_path;
+    }
+
+  moved = move_url(url, eb->route->read_prefix, eb->route->write_prefix,
+                   result_pool);
+  return moved ? moved : copyfrom_path;
+}
+
+static svn_error_t *
+route_set_target_revision(void *edit_baton,
+                          svn_revnum_t target_revision,
+                          apr_pool_t *scratch_pool)
+{
+  route_edit_baton_t *eb = edit_baton;
+
+  return eb->editor->set_target_revision(eb->edit_baton, target_revision,
+                                         scratch_pool);
+}
+
+static svn_error_t *
+route_open_root(void *edit_baton,
+                svn_revnum_t base_revision,
+                apr_pool_t *result_pool,
+                void **root_baton)
+{
+  route_edit_baton_t *eb = edit_baton;
+  void *baton;
+
+  SVN_ERR(eb->editor->open_root(eb->edit_baton, base_revision, result_pool,
+                                &baton));
+  *root_baton = route_node(eb, baton, result_pool);
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+route_delete_entry(const char *path,
+                   svn_revnum_t revision,
+                   void *parent_baton,
+                   apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *pb = parent_baton;
+
+  return pb->eb->editor->delete_entry(path, revision, pb->baton,
+                                      scratch_pool);
+}
+
+static svn_error_t *
+route_add_directory(const char *path,
+                    void *parent_baton,
+                    const char *copyfrom_path,
+                    svn_revnum_t copyfrom_revision,
+                    apr_pool_t *result_pool,
+                    void **child_baton)
+{
+  route_node_baton_t *pb = parent_baton;
+  void *baton;
+
+  SVN_ERR(pb->eb->editor->add_directory(
+            path, pb->baton,
+            route_copyfrom(pb->eb, copyfrom_path, result_pool),
+            copyfrom_revision, result_pool, &baton));
+  *child_baton = route_node(pb->eb, baton, result_pool);
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+route_open_directory(const char *path,
+                     void *parent_baton,
+                     svn_revnum_t base_revision,
+                     apr_pool_t *result_pool,
+                     void **child_baton)
+{
+  route_node_baton_t *pb = parent_baton;
+  void *baton;
+
+  SVN_ERR(pb->eb->editor->open_directory(path, pb->baton, base_revision,
+                                         result_pool, &baton));
+  *child_baton = route_node(pb->eb, baton, result_pool);
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+route_change_dir_prop(void *dir_baton,
+                      const char *name,
+                      const svn_string_t *value,
+                      apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *db = dir_baton;
+
+  return db->eb->editor->change_dir_prop(db->baton, name, value,
+                                         scratch_pool);
+}
+
+static svn_error_t *
+route_close_directory(void *dir_baton,
+                      apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *db = dir_baton;
+
+  return db->eb->editor->close_directory(db->baton, scratch_pool);
+}
+
+static svn_error_t *
+route_absent_directory(const char *path,
+                       void *parent_baton,
+                       apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *pb = parent_baton;
+
+  return pb->eb->editor->absent_directory(path, pb->baton, scratch_pool);
+}
+
+static svn_error_t *
+route_add_file(const char *path,
+               void *parent_baton,
+               const char *copyfrom_path,
+               svn_revnum_t copyfrom_revision,
+               apr_pool_t *result_pool,
+               void **file_baton)
+{
+  route_node_baton_t *pb = parent_baton;
+  void *baton;
+
+  SVN_ERR(pb->eb->editor->add_file(
+            path, pb->baton,
+            route_copyfrom(pb->eb, copyfrom_path, result_pool),
+            copyfrom_revision, result_pool, &baton));
+  *file_baton = route_node(pb->eb, baton, result_pool);
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+route_open_file(const char *path,
+                void *parent_baton,
+                svn_revnum_t base_revision,
+                apr_pool_t *result_pool,
+                void **file_baton)
+{
+  route_node_baton_t *pb = parent_baton;
+  void *baton;
+
+  SVN_ERR(pb->eb->editor->open_file(path, pb->baton, base_revision,
+                                    result_pool, &baton));
+  *file_baton = route_node(pb->eb, baton, result_pool);
+  return SVN_NO_ERROR;
+}
+
+static svn_error_t *
+route_apply_textdelta(void *file_baton,
+                      const char *base_checksum,
+                      apr_pool_t *result_pool,
+                      svn_txdelta_window_handler_t *handler,
+                      void **handler_baton)
+{
+  route_node_baton_t *fb = file_baton;
+
+  return fb->eb->editor->apply_textdelta(fb->baton, base_checksum,
+                                         result_pool, handler, handler_baton);
+}
+
+static svn_error_t *
+route_apply_textdelta_stream(const svn_delta_editor_t *editor,
+                             void *file_baton,
+                             const char *base_checksum,
+                             svn_txdelta_stream_open_func_t open_func,
+                             void *open_baton,
+                             apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *fb = file_baton;
+
+  return fb->eb->editor->apply_textdelta_stream(fb->eb->editor, fb->baton,
+                                                base_checksum, open_func,
+                                                open_baton, scratch_pool);
+}
+
+static svn_error_t *
+route_change_file_prop(void *file_baton,
+                       const char *name,
+                       const svn_string_t *value,
+                       apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *fb = file_baton;
+
+  return fb->eb->editor->change_file_prop(fb->baton, name, value,
+                                          scratch_pool);
+}
+
+static svn_error_t *
+route_close_file(void *file_baton,
+                 const char *text_checksum,
+                 apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *fb = file_baton;
+
+  return fb->eb->editor->close_file(fb->baton, text_checksum, scratch_pool);
+}
+
+static svn_error_t *
+route_absent_file(const char *path,
+                  void *parent_baton,
+                  apr_pool_t *scratch_pool)
+{
+  route_node_baton_t *pb = parent_baton;
+
+  return pb->eb->editor->absent_file(path, pb->baton, scratch_pool);
+}
+
+static svn_error_t *
+route_close_edit(void *edit_baton,
+                 apr_pool_t *scratch_pool)
+{
+  route_edit_baton_t *eb = edit_baton;
+
+  return eb->editor->close_edit(eb->edit_baton, scratch_pool);
+}
+
+static svn_error_t *
+route_abort_edit(void *edit_baton,
+                 apr_pool_t *scratch_pool)
+{
+  route_edit_baton_t *eb = edit_baton;
+
+  return eb->editor->abort_edit(eb->edit_baton, scratch_pool);
+}
+
 svn_error_t *
 svn_ra__dup_session(svn_ra_session_t **new_session,
                     svn_ra_session_t *old_session,
@@ -470,6 +1133,11 @@ svn_ra__dup_session(svn_ra_session_t **new_session,
   session->cancel_baton = old_session->cancel_baton;
   session->vtable = old_session->vtable;
   session->pool = result_pool;
+  session->callbacks = old_session->callbacks;
+  session->callback_baton = old_session->callback_baton;
+  if (old_session->config)
+    SVN_ERR(svn_config_copy_config(&session->config, old_session->config,
+                                   result_pool));
 
   SVN_ERR(old_session->vtable->dup_session(session,
                                            old_session,
@@ -565,6 +1233,8 @@ svn_error_t *svn_ra_change_rev_prop2(svn_ra_session_t *session,
 {
   SVN_ERR_ASSERT(SVN_IS_VALID_REVNUM(rev));
 
+  SVN_ERR(get_write_session(&session, session, pool));
+
   /* If an old value was specified, make sure the server supports
    * specifying it. */
   if (old_value_p)
@@ -618,10 +1288,54 @@ svn_error_t *svn_ra_get_commit_editor3(svn_ra_session_t *session,
                                        svn_boolean_t keep_locks,
                                        apr_pool_t *pool)
 {
-  return session->vtable->get_commit_editor(session, editor, edit_baton,
-                                            revprop_table,
-                                            commit_callback, commit_baton,
-                                            lock_tokens, keep_locks, pool);
+  svn_ra_session_t *write_session;
+  route_edit_baton_t *eb;
+  svn_delta_editor_t *route_editor;
+
+  SVN_ERR(get_write_session(&write_session, session, pool));
+  if (write_session == session)
+    return session->vtable->get_commit_editor(session, editor, edit_baton,
+                                              revprop_table,
+                                              commit_callback, commit_baton,
+                                              lock_tokens, keep_locks, pool);
+
+  route_commit_callback_wrap(&commit_callback, &commit_baton,
+                             session->write_route, pool);
+  eb = apr_pcalloc(pool, sizeof(*eb));
+  eb->route = session->write_route;
+  SVN_ERR(write_session->vtable->get_commit_editor(write_session,
+                                                   &eb->editor,
+                                                   &eb->edit_baton,
+                                                   revprop_table,
+                                                   commit_callback,
+                                                   commit_baton,
+                                                   lock_tokens, keep_locks,
+                                                   pool));
+
+  route_editor = svn_delta_default_editor(pool);
+  route_editor->set_target_revision = route_set_target_revision;
+  route_editor->open_root = route_open_root;
+  route_editor->delete_entry = route_delete_entry;
+  route_editor->add_directory = route_add_directory;
+  route_editor->open_directory = route_open_directory;
+  route_editor->change_dir_prop = route_change_dir_prop;
+  route_editor->close_directory = route_close_directory;
+  route_editor->absent_directory = route_absent_directory;
+  route_editor->add_file = route_add_file;
+  route_editor->open_file = route_open_file;
+  route_editor->apply_textdelta = route_apply_textdelta;
+  route_editor->apply_textdelta_stream = eb->editor->apply_textdelta_stream
+                                         ? route_apply_textdelta_stream
+                                         : NULL;
+  route_editor->change_file_prop = route_change_file_prop;
+  route_editor->close_file = route_close_file;
+  route_editor->absent_file = route_absent_file;
+  route_editor->close_edit = route_close_edit;
+  route_editor->abort_edit = route_abort_edit;
+
+  *editor = route_editor;
+  *edit_baton = eb;
+  return SVN_NO_ERROR;
 }
 
 svn_error_t *svn_ra_get_file(svn_ra_session_t *session,
@@ -1093,6 +1807,8 @@ svn_error_t *svn_ra_lock(svn_ra_session_t *session,
       (SVN_ERR_XML_UNESCAPABLE_DATA, NULL,
        _("Lock comment contains illegal characters"));
 
+  SVN_ERR(get_write_session(&session, session, pool));
+
   return session->vtable->lock(session, path_revs, comment, steal_lock,
                                lock_func, lock_baton, pool);
 }
@@ -1112,6 +1828,8 @@ svn_error_t *svn_ra_unlock(svn_ra_session_t *session,
 
       SVN_ERR_ASSERT(svn_relpath_is_canonical(path));
     }
+
+  SVN_ERR(get_write_session(&session, session, pool));
 
   return session->vtable->unlock(session, path_tokens, break_lock,
                                  lock_func, lock_baton, pool);
@@ -1398,6 +2116,18 @@ svn_ra__get_commit_ev2(svn_editor_t **editor,
                        apr_pool_t *result_pool,
                        apr_pool_t *scratch_pool)
 {
+  svn_ra_session_t *write_session;
+
+  /* Ev2 names copy sources by repository relpath, so only the session and
+     the commit callback need routing. */
+  SVN_ERR(get_write_session(&write_session, session, scratch_pool));
+  if (write_session != session)
+    {
+      route_commit_callback_wrap(&commit_callback, &commit_baton,
+                                 session->write_route, result_pool);
+      session = write_session;
+    }
+
   if (session->vtable->get_commit_ev2 == NULL)
     {
       /* The specific RA layer does not have an implementation. Use our

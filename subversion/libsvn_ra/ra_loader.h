@@ -402,6 +402,18 @@ struct svn_ra_session_t {
 
   /* Private data for the RA implementation. */
   void *priv;
+
+  /* What svn_ra_open5() was given, kept to open a write-route session. */
+  const svn_ra_callbacks2_t *callbacks;
+  void *callback_baton;
+  apr_hash_t *config;
+
+  /* Write routing (SVN_CONFIG_SECTION_WRITE_ROUTES, see get_write_session()
+     in ra_loader.c).  WRITE_ROUTE is NULL when writes use this session,
+     which is always true of a write-route session itself. */
+  svn_boolean_t write_route_checked;
+  const struct svn_ra__write_route_t *write_route;
+  svn_ra_session_t *write_session;
 };
 
 /* Each libsvn_ra_foo defines a function named svn_ra_foo__init of this type.

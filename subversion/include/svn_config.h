@@ -162,6 +162,12 @@ typedef struct svn_config_t svn_config_t;
 /** @since New in 1.9. */
 #define SVN_CONFIG_OPTION_DIFF_IGNORE_CONTENT_TYPE  "diff-ignore-content-type"
 #define SVN_CONFIG_SECTION_TUNNELS              "tunnels"
+/** Routes that send a repository's writes (commits, locks, unlocks and
+ * revision property changes) to a different URL than its reads.  Each
+ * option is a route: NAME = READ-URL-PREFIX WRITE-URL-PREFIX.  Write
+ * routes never save credentials, and URLs on them redirect to the read
+ * route.  Not in upstream Subversion; added by the write-routes fork. */
+#define SVN_CONFIG_SECTION_WRITE_ROUTES         "write-routes"
 #define SVN_CONFIG_SECTION_AUTO_PROPS           "auto-props"
 /** @since New in 1.8. */
 #define SVN_CONFIG_SECTION_WORKING_COPY         "working-copy"
